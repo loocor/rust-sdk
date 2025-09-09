@@ -5,18 +5,18 @@ use thiserror::Error;
 use super::*;
 use crate::{
     model::{
-        CallToolRequest, CallToolRequestParam, CallToolResult, CancelledNotification,
+        ArgumentInfo, CallToolRequest, CallToolRequestParam, CallToolResult, CancelledNotification,
         CancelledNotificationParam, ClientInfo, ClientJsonRpcMessage, ClientNotification,
         ClientRequest, ClientResult, CompleteRequest, CompleteRequestParam, CompleteResult,
-        GetPromptRequest, GetPromptRequestParam, GetPromptResult, InitializeRequest,
-        InitializedNotification, JsonRpcResponse, ListPromptsRequest, ListPromptsResult,
-        ListResourceTemplatesRequest, ListResourceTemplatesResult, ListResourcesRequest,
-        ListResourcesResult, ListToolsRequest, ListToolsResult, PaginatedRequestParam,
-        ProgressNotification, ProgressNotificationParam, ReadResourceRequest,
-        ReadResourceRequestParam, ReadResourceResult, RequestId, RootsListChangedNotification,
-        ServerInfo, ServerJsonRpcMessage, ServerNotification, ServerRequest, ServerResult,
-        SetLevelRequest, SetLevelRequestParam, SubscribeRequest, SubscribeRequestParam,
-        UnsubscribeRequest, UnsubscribeRequestParam,
+        CompletionContext, CompletionInfo, GetPromptRequest, GetPromptRequestParam,
+        GetPromptResult, InitializeRequest, InitializedNotification, JsonRpcResponse,
+        ListPromptsRequest, ListPromptsResult, ListResourceTemplatesRequest,
+        ListResourceTemplatesResult, ListResourcesRequest, ListResourcesResult, ListToolsRequest,
+        ListToolsResult, PaginatedRequestParam, ProgressNotification, ProgressNotificationParam,
+        ReadResourceRequest, ReadResourceRequestParam, ReadResourceResult, Reference, RequestId,
+        RootsListChangedNotification, ServerInfo, ServerJsonRpcMessage, ServerNotification,
+        ServerRequest, ServerResult, SetLevelRequest, SetLevelRequestParam, SubscribeRequest,
+        SubscribeRequestParam, UnsubscribeRequest, UnsubscribeRequestParam,
     },
     transport::DynamicTransportError,
 };
@@ -75,18 +75,59 @@ where
 }
 
 /// Helper function to expect a response from the stream
-async fn expect_response<T>(
+async fn expect_response<T, S>(
     transport: &mut T,
     context: &str,
+    service: &S,
+    peer: Peer<RoleClient>,
 ) -> Result<(ServerResult, RequestId), ClientInitializeError>
 where
     T: Transport<RoleClient>,
+    S: Service<RoleClient>,
 {
-    let msg = expect_next_message(transport, context).await?;
+    loop {
+        let message = expect_next_message(transport, context).await?;
+        match message {
+            // Expected message to complete the initialization
+            ServerJsonRpcMessage::Response(JsonRpcResponse { id, result, .. }) => {
+                break Ok((result, id));
+            }
+            // Server could send logging messages before handshake
+            ServerJsonRpcMessage::Notification(mut notification) => {
+                let ServerNotification::LoggingMessageNotification(logging) =
+                    &mut notification.notification
+                else {
+                    tracing::warn!(?notification, "Received unexpected message");
+                    continue;
+                };
 
-    match msg {
-        ServerJsonRpcMessage::Response(JsonRpcResponse { id, result, .. }) => Ok((result, id)),
-        _ => Err(ClientInitializeError::ExpectedInitResponse(Some(msg))),
+                let mut context = NotificationContext {
+                    peer: peer.clone(),
+                    meta: Meta::default(),
+                    extensions: Extensions::default(),
+                };
+
+                if let Some(meta) = logging.extensions.get_mut::<Meta>() {
+                    std::mem::swap(&mut context.meta, meta);
+                }
+                std::mem::swap(&mut context.extensions, &mut logging.extensions);
+
+                if let Err(error) = service
+                    .handle_notification(notification.notification, context)
+                    .await
+                {
+                    tracing::warn!(?error, "Handle logging before handshake failed.");
+                }
+            }
+            // Server could send pings before handshake
+            ServerJsonRpcMessage::Request(ref request)
+                if matches!(request.request, ServerRequest::PingRequest(_)) =>
+            {
+                tracing::trace!("Received ping request. Ignored.")
+            }
+            // Server SHOULD NOT send any other messages before handshake. We ignore them anyway
+            _ => tracing::warn!(?message, "Received unexpected message"),
+        }
     }
 }
 
@@ -183,7 +224,15 @@ where
             context: "send initialize request".into(),
         })?;
 
-    let (response, response_id) = expect_response(&mut transport, "initialize response").await?;
+    let (peer, peer_rx) = Peer::new(id_provider, None);
+
+    let (response, response_id) = expect_response(
+        &mut transport,
+        "initialize response",
+        &service,
+        peer.clone(),
+    )
+    .await?;
 
     if id != response_id {
         return Err(ClientInitializeError::ConflictInitResponseId(
@@ -195,6 +244,7 @@ where
     let ServerResult::InitializeResult(initialize_result) = response else {
         return Err(ClientInitializeError::ExpectedInitResult(Some(response)));
     };
+    peer.set_peer_info(initialize_result);
 
     // send notification
     let notification = ClientJsonRpcMessage::notification(
@@ -206,7 +256,6 @@ where
     transport.send(notification).await.map_err(|error| {
         ClientInitializeError::transport::<T>(error, "send initialized notification")
     })?;
-    let (peer, peer_rx) = Peer::new(id_provider, Some(initialize_result));
     Ok(serve_inner(service, transport, peer, peer_rx, ct))
 }
 
@@ -389,5 +438,97 @@ impl Peer<RoleClient> {
             }
         }
         Ok(resource_templates)
+    }
+
+    /// Convenient method to get completion suggestions for a prompt argument
+    ///
+    /// # Arguments
+    /// * `prompt_name` - Name of the prompt being completed
+    /// * `argument_name` - Name of the argument being completed  
+    /// * `current_value` - Current partial value of the argument
+    /// * `context` - Optional context with previously resolved arguments
+    ///
+    /// # Returns
+    /// CompletionInfo with suggestions for the specified prompt argument
+    pub async fn complete_prompt_argument(
+        &self,
+        prompt_name: impl Into<String>,
+        argument_name: impl Into<String>,
+        current_value: impl Into<String>,
+        context: Option<CompletionContext>,
+    ) -> Result<CompletionInfo, ServiceError> {
+        let request = CompleteRequestParam {
+            r#ref: Reference::for_prompt(prompt_name),
+            argument: ArgumentInfo {
+                name: argument_name.into(),
+                value: current_value.into(),
+            },
+            context,
+        };
+
+        let result = self.complete(request).await?;
+        Ok(result.completion)
+    }
+
+    /// Convenient method to get completion suggestions for a resource URI argument
+    ///
+    /// # Arguments
+    /// * `uri_template` - URI template pattern being completed
+    /// * `argument_name` - Name of the URI parameter being completed
+    /// * `current_value` - Current partial value of the parameter
+    /// * `context` - Optional context with previously resolved arguments
+    ///
+    /// # Returns
+    /// CompletionInfo with suggestions for the specified resource URI argument
+    pub async fn complete_resource_argument(
+        &self,
+        uri_template: impl Into<String>,
+        argument_name: impl Into<String>,
+        current_value: impl Into<String>,
+        context: Option<CompletionContext>,
+    ) -> Result<CompletionInfo, ServiceError> {
+        let request = CompleteRequestParam {
+            r#ref: Reference::for_resource(uri_template),
+            argument: ArgumentInfo {
+                name: argument_name.into(),
+                value: current_value.into(),
+            },
+            context,
+        };
+
+        let result = self.complete(request).await?;
+        Ok(result.completion)
+    }
+
+    /// Simple completion for a prompt argument without context
+    ///
+    /// This is a convenience wrapper around `complete_prompt_argument` for
+    /// simple completion scenarios that don't require context awareness.
+    pub async fn complete_prompt_simple(
+        &self,
+        prompt_name: impl Into<String>,
+        argument_name: impl Into<String>,
+        current_value: impl Into<String>,
+    ) -> Result<Vec<String>, ServiceError> {
+        let completion = self
+            .complete_prompt_argument(prompt_name, argument_name, current_value, None)
+            .await?;
+        Ok(completion.values)
+    }
+
+    /// Simple completion for a resource URI argument without context
+    ///
+    /// This is a convenience wrapper around `complete_resource_argument` for
+    /// simple completion scenarios that don't require context awareness.
+    pub async fn complete_resource_simple(
+        &self,
+        uri_template: impl Into<String>,
+        argument_name: impl Into<String>,
+        current_value: impl Into<String>,
+    ) -> Result<Vec<String>, ServiceError> {
+        let completion = self
+            .complete_resource_argument(uri_template, argument_name, current_value, None)
+            .await?;
+        Ok(completion.values)
     }
 }
